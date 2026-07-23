@@ -1,0 +1,190 @@
+name: distributed-cache-lab
+
+x-api-environment: &api-environment
+  NODE_ENV: production
+  PORT: 3000
+  DB_HOST: toxiproxy
+  DB_PORT: 25432
+  POSTGRES_USER: ${POSTGRES_USER:-cachelab}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cachelab}
+  POSTGRES_DB: ${POSTGRES_DB:-cachelab}
+  REDIS_HOST: toxiproxy
+  REDIS_PORT: 26379
+  TOXIPROXY_URL: http://toxiproxy:8474
+  ORIGIN_DELAY_MS: ${ORIGIN_DELAY_MS:-40}
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+
+x-worker-environment: &worker-environment
+  NODE_ENV: production
+  DB_HOST: toxiproxy
+  DB_PORT: 25432
+  POSTGRES_USER: ${POSTGRES_USER:-cachelab}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cachelab}
+  POSTGRES_DB: ${POSTGRES_DB:-cachelab}
+  REDIS_HOST: toxiproxy
+  REDIS_PORT: 26379
+  RUN_MIGRATIONS: 'false'
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cachelab}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cachelab}
+      POSTGRES_DB: ${POSTGRES_DB:-cachelab}
+    ports:
+      - '15432:5432'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-cachelab}']
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7.4-alpine
+    command: redis-server --save '' --appendonly no --maxmemory-policy noeviction
+    ports:
+      - '16379:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    ports:
+      - '8474:8474'
+      - '25432:25432'
+      - '26379:26379'
+    healthcheck:
+      test: ['CMD', '/toxiproxy-cli', 'list']
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  toxiproxy-config:
+    image: curlimages/curl:8.14.1
+    depends_on:
+      toxiproxy:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        curl -fsS -X DELETE http://toxiproxy:8474/proxies/redis || true
+        curl -fsS -X DELETE http://toxiproxy:8474/proxies/postgres || true
+        curl -fsS -X POST http://toxiproxy:8474/proxies \
+          -H 'content-type: application/json' \
+          -d '{"name":"redis","listen":"0.0.0.0:26379","upstream":"redis:6379"}'
+        curl -fsS -X POST http://toxiproxy:8474/proxies \
+          -H 'content-type: application/json' \
+          -d '{"name":"postgres","listen":"0.0.0.0:25432","upstream":"postgres:5432"}'
+    restart: 'no'
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.63.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: 'true'
+    ports:
+      - '16686:16686'
+      - '4318:4318'
+
+  api-a:
+    build:
+      context: .
+      target: api
+    environment:
+      <<: *api-environment
+      INSTANCE_ID: api-a
+      OTEL_SERVICE_NAME: cache-api-a
+      RUN_MIGRATIONS: 'true'
+      SEED_ON_START: 'true'
+    depends_on:
+      toxiproxy-config:
+        condition: service_completed_successfully
+      jaeger:
+        condition: service_started
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://127.0.0.1:3000/api/health/live >/dev/null']
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  api-b:
+    build:
+      context: .
+      target: api
+    environment:
+      <<: *api-environment
+      INSTANCE_ID: api-b
+      OTEL_SERVICE_NAME: cache-api-b
+      RUN_MIGRATIONS: 'false'
+      SEED_ON_START: 'false'
+    depends_on:
+      api-a:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://127.0.0.1:3000/api/health/live >/dev/null']
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  worker-a:
+    build:
+      context: .
+      target: worker
+    environment:
+      <<: *worker-environment
+      INSTANCE_ID: worker-a
+      OTEL_SERVICE_NAME: cache-worker-a
+    depends_on:
+      api-a:
+        condition: service_healthy
+
+  worker-b:
+    build:
+      context: .
+      target: worker
+    environment:
+      <<: *worker-environment
+      INSTANCE_ID: worker-b
+      OTEL_SERVICE_NAME: cache-worker-b
+    depends_on:
+      api-a:
+        condition: service_healthy
+
+  web:
+    build:
+      context: .
+      target: web
+    ports:
+      - '5175:80'
+    depends_on:
+      api-a:
+        condition: service_healthy
+      api-b:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://127.0.0.1/health >/dev/null']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=2h
+    volumes:
+      - ./infra/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - '${PROMETHEUS_PORT:-19090}:9090'
+    depends_on:
+      - api-a
+      - api-b

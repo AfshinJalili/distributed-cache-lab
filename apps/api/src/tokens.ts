@@ -1,0 +1,6 @@
+export const REDIS = Symbol('REDIS')
+export const LAB_STATE = Symbol('LAB_STATE')
+export const CACHE_STORE = Symbol('CACHE_STORE')
+export const EVENT_BUS = Symbol('EVENT_BUS')
+export const DISTRIBUTED_LOCK = Symbol('DISTRIBUTED_LOCK')
+export const REFRESH_QUEUE = Symbol('REFRESH_QUEUE')

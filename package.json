@@ -1,0 +1,33 @@
+{
+  "name": "distributed-cache-lab",
+  "version": "1.0.0",
+  "private": true,
+  "license": "MIT",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build:shared": "npm run build -w @dcl/contracts && npm run build -w @dcl/platform",
+    "build": "npm run build:shared && npm run build -w @dcl/api && npm run build -w @dcl/worker && npm run build -w @dcl/web",
+    "typecheck": "npm run build:shared && npm run typecheck --workspaces --if-present",
+    "lint": "eslint .",
+    "test": "npm run build:shared && npm run test --workspaces --if-present",
+    "test:integration": "npm run test:integration -w @dcl/platform",
+    "test:e2e": "node scripts/e2e.mjs",
+    "test:e2e:outbox": "node scripts/outbox-e2e.mjs",
+    "load": "k6 run load/cache-lab.js"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^24.10.0",
+    "eslint": "^10.7.0",
+    "eslint-plugin-react-hooks": "^7.0.1",
+    "globals": "^17.3.0",
+    "typescript": "~6.0.3",
+    "typescript-eslint": "^8.64.0"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
