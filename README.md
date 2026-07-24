@@ -69,8 +69,9 @@ npm run lint
 npm run typecheck
 npm test
 
-# Requires Redis on localhost:16379
-RUN_INTEGRATION=true TEST_REDIS_PORT=16379 npm run test:integration
+# Requires Redis and PostgreSQL (the shown ports match the Compose stack)
+RUN_INTEGRATION=true RUN_OUTBOX_INTEGRATION=true \
+  TEST_REDIS_PORT=16379 TEST_DB_PORT=15432 npm run test:integration
 
 # Requires the full Compose stack
 npm run test:e2e:outbox

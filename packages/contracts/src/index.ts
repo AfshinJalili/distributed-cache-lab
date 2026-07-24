@@ -11,7 +11,23 @@ export type EvictionPolicy = 'LRU' | 'LFU'
 export type WritePolicy = 'invalidate' | 'write-through'
 export type CacheResult = 'HIT' | 'MISS' | 'STALE' | 'NEGATIVE_HIT' | 'BYPASS'
 export type CacheEntryHealth = 'fresh' | 'stale' | 'expired' | 'negative'
-export type FaultName = 'redis-outage' | 'slow-origin'
+export const faultNames = ['redis-outage', 'slow-origin'] as const
+export type FaultName = (typeof faultNames)[number]
+
+export const faultDefinitions: Record<FaultName, { label: string; detail: string }> = {
+  'redis-outage': {
+    label: 'Redis outage',
+    detail: 'circuit-breaker bypass',
+  },
+  'slow-origin': {
+    label: 'Slow origin',
+    detail: '+750ms PostgreSQL latency',
+  },
+}
+
+export function isFaultName(value: string): value is FaultName {
+  return (faultNames as readonly string[]).includes(value)
+}
 
 export type CacheSettings = {
   ttlSeconds: number
@@ -83,6 +99,7 @@ export type LabEventKind =
   | 'write'
   | 'evict'
   | 'coalesce'
+  | 'bypass'
   | 'fault'
   | 'system'
 

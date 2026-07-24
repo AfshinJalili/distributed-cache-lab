@@ -9,6 +9,7 @@ export const keys = {
   cacheIndex: 'dcl:cache:index',
   cacheLru: 'dcl:cache:lru',
   cacheLfu: 'dcl:cache:lfu',
+  cacheVersionWatermarks: 'dcl:cache:version-watermarks',
   cacheEntryPrefix: 'dcl:cache:entry:',
   lockPrefix: 'dcl:lock:',
 } as const

@@ -15,10 +15,12 @@ import type {
 import {
   CacheStore,
   CircuitBreaker,
+  delay,
   DistributedLock,
   EventBus,
   LabStateStore,
   ResourceEntity,
+  toResourceView,
 } from '@dcl/platform'
 import { MetricsService } from './metrics.service'
 import {
@@ -33,19 +35,6 @@ export type ReadOutcome = {
   response: ResourceResponse
   trace: RequestTrace
   statusCode: 200 | 404
-}
-
-function toView(entity: ResourceEntity): ResourceView {
-  return {
-    key: entity.key,
-    version: entity.version,
-    document: entity.document,
-    updatedAt: entity.updatedAt.toISOString(),
-  }
-}
-
-function wait(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds))
 }
 
 @Injectable()
@@ -90,28 +79,45 @@ export class ResourceCacheService {
     }
 
     if (record && record.softExpiresAt > now) {
-      const touched = await this.breaker.execute(() => this.cache.touch(record, now))
-      return this.finish({
-        key,
-        startedAt,
-        now,
-        result: touched.negative ? 'NEGATIVE_HIT' : 'HIT',
-        resource: touched.resource,
-        ageSeconds: Math.floor((now - touched.createdAt) / 1000),
-        ttlSeconds: Math.max(0, Math.ceil((touched.softExpiresAt - now) / 1000)),
-        hops: ['client', `${this.instanceId} · cache lookup`, 'Redis · fresh entry'],
-        note: touched.negative
-          ? 'A short-lived not-found sentinel protected PostgreSQL.'
-          : 'Fresh Redis data returned without an origin read.',
-        sharedMetrics: touched.negative
-          ? { requests: 1, hits: 1, negativeHits: 1 }
-          : { requests: 1, hits: 1 },
-        eventKind: touched.negative ? 'negative' : 'hit',
-      })
+      try {
+        const touched = await this.breaker.execute(() => this.cache.touch(key, now))
+        record = touched
+        if (touched && touched.softExpiresAt > now) {
+          return this.finish({
+            key,
+            startedAt,
+            now,
+            result: touched.negative ? 'NEGATIVE_HIT' : 'HIT',
+            resource: touched.resource,
+            ageSeconds: Math.floor((now - touched.createdAt) / 1000),
+            ttlSeconds: Math.max(0, Math.ceil((touched.softExpiresAt - now) / 1000)),
+            hops: ['client', `${this.instanceId} · cache lookup`, 'Redis · fresh entry'],
+            note: touched.negative
+              ? 'A short-lived not-found sentinel protected PostgreSQL.'
+              : 'Fresh Redis data returned without an origin read.',
+            sharedMetrics: touched.negative
+              ? { requests: 1, hits: 1, negativeHits: 1 }
+              : { requests: 1, hits: 1 },
+            eventKind: touched.negative ? 'negative' : 'hit',
+          })
+        }
+      } catch (error) {
+        await this.observeCacheFailure('touch', key, error)
+        return this.readBypass(key, startedAt, 'Redis touch failed; request bypassed the cache')
+      }
     }
 
     if (record && settings.staleWhileRevalidate) {
-      await this.enqueueRefresh(key)
+      try {
+        await this.enqueueRefresh(key)
+      } catch (error) {
+        await this.observeCacheFailure('refresh_enqueue', key, error)
+        return this.readBypass(
+          key,
+          startedAt,
+          'Redis refresh queue unavailable; request bypassed the cache',
+        )
+      }
       return this.finish({
         key,
         startedAt,
@@ -132,8 +138,6 @@ export class ResourceCacheService {
       })
     }
 
-    await this.safeMetrics({ requests: 1, misses: 1 })
-
     if (!settings.coalescing) {
       return this.fetchAndFill(key, settings, now, startedAt, false)
     }
@@ -142,9 +146,7 @@ export class ResourceCacheService {
     try {
       lease = await this.breaker.execute(() => this.locks.acquire(key))
     } catch {
-      return this.readBypass(key, startedAt, 'Redis lock unavailable; request bypassed the cache', {
-        countRequest: false,
-      })
+      return this.readBypass(key, startedAt, 'Redis lock unavailable; request bypassed the cache')
     }
 
     if (lease) {
@@ -166,18 +168,21 @@ export class ResourceCacheService {
     })
 
     for (let attempt = 0; attempt < 20; attempt += 1) {
-      await wait(25 + attempt * 2)
+      await delay(25 + attempt * 2)
       try {
-        const filled = await this.cache.get(key, await this.labState.now())
-        if (filled && filled.softExpiresAt > now) {
+        const currentNow = await this.labState.now()
+        const filled = await this.breaker.execute(() => this.cache.get(key, currentNow))
+        if (filled && filled.softExpiresAt > currentNow) {
+          const touched = await this.breaker.execute(() => this.cache.touch(key, currentNow))
+          if (!touched || touched.softExpiresAt <= currentNow) continue
           return this.finish({
             key,
             startedAt,
-            now,
-            result: 'MISS',
-            resource: filled.resource,
-            ageSeconds: 0,
-            ttlSeconds: Math.ceil((filled.softExpiresAt - now) / 1000),
+            now: currentNow,
+            result: touched.negative ? 'NEGATIVE_HIT' : 'HIT',
+            resource: touched.resource,
+            ageSeconds: Math.floor((currentNow - touched.createdAt) / 1000),
+            ttlSeconds: Math.ceil((touched.softExpiresAt - currentNow) / 1000),
             hops: [
               'client',
               `${this.instanceId} · cache MISS`,
@@ -185,12 +190,19 @@ export class ResourceCacheService {
               'Redis · filled by another replica',
             ],
             note: 'This miss was collapsed behind one origin read.',
-            sharedMetrics: {},
+            sharedMetrics: touched.negative
+              ? { requests: 1, hits: 1, negativeHits: 1 }
+              : { requests: 1, hits: 1 },
             eventKind: 'coalesce',
           })
         }
-      } catch {
-        break
+      } catch (error) {
+        await this.observeCacheFailure('coalesced_read', key, error)
+        return this.readBypass(
+          key,
+          startedAt,
+          'Redis unavailable while waiting for a cache fill; request bypassed the cache',
+        )
       }
     }
 
@@ -206,11 +218,11 @@ export class ResourceCacheService {
     lockTimedOut: boolean,
   ): Promise<ReadOutcome> {
     const resource = await this.readOrigin(key)
-    let evictedKey: ResourceKey | null = null
+    let evictedKey: ResourceKey | null
     try {
       const result = await this.breaker.execute(() => this.cache.put(key, resource, settings, now))
       evictedKey = result.evictedKey
-      if (evictedKey) {
+      if (result.written && evictedKey) {
         await this.safeMetrics({ evictions: 1 })
         await this.safeEvent({
           at: now,
@@ -221,9 +233,25 @@ export class ResourceCacheService {
         })
       }
     } catch (error) {
-      this.metrics.observeCacheError(this.instanceId, 'put')
-      await this.safeMetrics({ cacheErrors: 1 })
-      this.logger.warn({ event: 'cache_error', operation: 'put', key, error: String(error) })
+      await this.observeCacheFailure('put', key, error)
+      return this.finish({
+        key,
+        startedAt,
+        now,
+        result: 'BYPASS',
+        resource,
+        ageSeconds: 0,
+        ttlSeconds: 0,
+        hops: [
+          'client',
+          `${this.instanceId} · cache MISS`,
+          'PostgreSQL · origin read',
+          'Redis · cache fill failed',
+        ],
+        note: 'Origin data returned, but Redis could not store it.',
+        sharedMetrics: { requests: 1, bypasses: 1 },
+        eventKind: 'bypass',
+      })
     }
 
     return this.finish({
@@ -244,7 +272,7 @@ export class ResourceCacheService {
       note: resource
         ? `Origin data cached${evictedKey ? ` after evicting ${evictedKey}` : ''}.`
         : 'Origin returned no row; a short-lived negative entry was stored.',
-      sharedMetrics: {},
+      sharedMetrics: { requests: 1, misses: 1 },
       eventKind: 'miss',
     })
   }
@@ -253,7 +281,6 @@ export class ResourceCacheService {
     key: ResourceKey,
     startedAt: number,
     note: string,
-    options: { countRequest?: boolean } = {},
   ): Promise<ReadOutcome> {
     const resource = await this.readOrigin(key, false)
     const latencyMs = Math.max(1, Math.round(performance.now() - startedAt))
@@ -268,7 +295,7 @@ export class ResourceCacheService {
     }
     this.metrics.observeRequest(this.instanceId, key, 'BYPASS', latencyMs)
     await this.safeMetrics({
-      requests: options.countRequest === false ? 0 : 1,
+      requests: 1,
       bypasses: 1,
       totalLatencyMs: latencyMs,
     })
@@ -289,7 +316,7 @@ export class ResourceCacheService {
   }
 
   private async readOrigin(key: ResourceKey, sharedMetric = true): Promise<ResourceView | null> {
-    if (this.originDelayMs > 0) await wait(this.originDelayMs)
+    if (this.originDelayMs > 0) await delay(this.originDelayMs)
     const entity = await this.resources.findOneBy({ key })
     this.metrics.observeOriginRead(this.instanceId, key)
     if (sharedMetric) await this.safeMetrics({ originReads: 1 })
@@ -300,7 +327,7 @@ export class ResourceCacheService {
       detail: `${this.instanceId} queried PostgreSQL`,
       resourceKey: key,
     })
-    return entity ? toView(entity) : null
+    return entity ? toResourceView(entity) : null
   }
 
   private async enqueueRefresh(key: ResourceKey): Promise<void> {
@@ -326,7 +353,7 @@ export class ResourceCacheService {
     hops: string[]
     note: string
     sharedMetrics: Partial<CacheMetrics>
-    eventKind: 'hit' | 'miss' | 'stale' | 'negative' | 'coalesce'
+    eventKind: 'hit' | 'miss' | 'stale' | 'negative' | 'coalesce' | 'bypass'
   }): Promise<ReadOutcome> {
     const latencyMs = Math.max(1, Math.round(performance.now() - input.startedAt))
     const trace: RequestTrace = {
@@ -372,6 +399,16 @@ export class ResourceCacheService {
 
   private async safeMetrics(changes: Partial<CacheMetrics>): Promise<void> {
     await this.labState.incrementMetrics(changes).catch(() => undefined)
+  }
+
+  private async observeCacheFailure(
+    operation: string,
+    key: ResourceKey,
+    error: unknown,
+  ): Promise<void> {
+    this.metrics.observeCacheError(this.instanceId, operation)
+    await this.safeMetrics({ cacheErrors: 1 })
+    this.logger.warn({ event: 'cache_error', operation, key, error: String(error) })
   }
 
   private async safeTrace(value: RequestTrace): Promise<void> {

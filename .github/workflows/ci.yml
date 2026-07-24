@@ -21,6 +21,19 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: cachelab
+          POSTGRES_PASSWORD: cachelab
+          POSTGRES_DB: cachelab
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cachelab"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -34,8 +47,15 @@ jobs:
       - run: npm run test:integration
         env:
           RUN_INTEGRATION: 'true'
+          RUN_OUTBOX_INTEGRATION: 'true'
           TEST_REDIS_HOST: localhost
           TEST_REDIS_PORT: 6379
+          TEST_REDIS_DB: 15
+          TEST_DB_HOST: localhost
+          TEST_DB_PORT: 5432
+          TEST_DB_USER: cachelab
+          TEST_DB_PASSWORD: cachelab
+          TEST_DB_NAME: cachelab
       - run: npm run build
 
   compose-e2e:

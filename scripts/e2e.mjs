@@ -37,10 +37,25 @@ assert.notEqual(
 
 await request('/lab/reset', { method: 'POST' })
 await request('/lab/flush', { method: 'POST' })
-await Promise.all(Array.from({ length: 16 }, () => request('/resources/catalog%3Ahome')))
+const burst = await Promise.all(
+  Array.from({ length: 16 }, () => request('/resources/catalog%3Ahome')),
+)
+const burstResults = burst.map(({ response }) => response.headers.get('x-cache-result'))
+assert.equal(
+  burstResults.filter((result) => result === 'MISS').length,
+  1,
+  'only the lock owner should report a cold miss',
+)
+assert.equal(
+  burstResults.filter((result) => result === 'HIT').length,
+  15,
+  'coalesced waiters should report hits after re-reading the fill',
+)
 const burstState = (await request('/lab/state')).body
 assert.equal(burstState.metrics.originReads, 1, 'coalesced cold burst must perform one origin read')
-assert.ok(burstState.metrics.coalesced >= 1, 'cold burst must collapse at least one waiter')
+assert.equal(burstState.metrics.misses, 1, 'only the lock owner should count as a miss')
+assert.equal(burstState.metrics.hits, 15, 'coalesced waiters should count as cache hits')
+assert.equal(burstState.metrics.coalesced, 15, 'every waiter should be recorded as coalesced')
 
 await request('/lab/flush', { method: 'POST' })
 const firstMissing = await request('/resources/product%3A404')
@@ -48,6 +63,42 @@ assert.equal(firstMissing.response.headers.get('x-cache-result'), 'MISS')
 const cachedMissing = await request('/resources/product%3A404')
 assert.equal(cachedMissing.response.headers.get('x-cache-result'), 'NEGATIVE_HIT')
 
+await request('/lab/reset', { method: 'POST' })
+await request('/lab/flush', { method: 'POST' })
+await request('/lab/settings', {
+  method: 'PATCH',
+  body: JSON.stringify({
+    ttlSeconds: 5,
+    staleWindowSeconds: 30,
+    staleWhileRevalidate: true,
+    ttlJitter: false,
+  }),
+})
+const swrWarm = await request('/resources/product%3A42')
+assert.equal(swrWarm.response.headers.get('x-cache-result'), 'MISS')
+await request('/lab/clock/advance', {
+  method: 'POST',
+  body: JSON.stringify({ seconds: 6 }),
+})
+const staleBurst = await Promise.all(
+  Array.from({ length: 8 }, () => request('/resources/product%3A42')),
+)
+assert.ok(
+  staleBurst.some(({ response }) => response.headers.get('x-cache-result') === 'STALE'),
+  'soft-expired data should be served while refresh runs',
+)
+const refreshedState = await waitFor(async () => {
+  const next = (await request('/lab/state')).body
+  const entry = next.entries.find((item) => item.key === 'product:42')
+  return entry?.health === 'fresh' && next.metrics.originReads === 2 ? next : undefined
+})
+assert.equal(
+  refreshedState.metrics.originReads,
+  2,
+  'a stale burst should add exactly one background origin read',
+)
+
+await request('/lab/reset', { method: 'POST' })
 const pricingBeforeWrite = await request('/resources/pricing%3Apro')
 assert.equal(pricingBeforeWrite.response.headers.get('x-cache-result'), 'MISS')
 const pricingHit = await request('/resources/pricing%3Apro')
@@ -59,6 +110,21 @@ await waitFor(async () => {
   return (
     reconciled.body.resource?.version === write.body.version &&
     reconciled.response.headers.get('x-cache-result') === 'MISS'
+  )
+})
+
+await request('/lab/reset', { method: 'POST' })
+await request('/lab/settings', {
+  method: 'PATCH',
+  body: JSON.stringify({ writePolicy: 'write-through', ttlJitter: false }),
+})
+await request('/resources/pricing%3Apro')
+const writeThrough = await request('/resources/pricing%3Apro/write', { method: 'POST' })
+await waitFor(async () => {
+  const reconciled = await request('/resources/pricing%3Apro')
+  return (
+    reconciled.body.resource?.version === writeThrough.body.version &&
+    reconciled.response.headers.get('x-cache-result') === 'HIT'
   )
 })
 
@@ -74,4 +140,6 @@ await request('/lab/faults/redis-outage', {
   body: JSON.stringify({ enabled: false }),
 })
 
-console.log('E2E passed: miss/hit, cross-replica coalescing, negative cache, outbox, and cache bypass')
+console.log(
+  'E2E passed: coalescing, negative cache, SWR, invalidate/write-through outbox, and cache bypass',
+)

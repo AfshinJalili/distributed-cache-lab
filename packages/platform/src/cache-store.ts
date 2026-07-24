@@ -31,6 +31,19 @@ local ttlMs = tonumber(ARGV[4])
 local capacity = tonumber(ARGV[5])
 local policy = ARGV[6]
 local now = tonumber(ARGV[7])
+local incomingVersion = tonumber(ARGV[8])
+
+local current = redis.call('GET', entryPrefix .. member)
+local watermark = tonumber(redis.call('HGET', KEYS[4], member) or '-1')
+if watermark > incomingVersion then
+  return {'', 0, current or payload}
+end
+if current then
+  local currentRecord = cjson.decode(current)
+  if tonumber(currentRecord.version) > incomingVersion then
+    return {'', 0, current}
+  end
+end
 
 local members = redis.call('SMEMBERS', indexKey)
 for _, current in ipairs(members) do
@@ -59,13 +72,44 @@ redis.call('SET', entryPrefix .. member, payload, 'PX', ttlMs)
 redis.call('SADD', indexKey, member)
 redis.call('ZADD', lruKey, now, member)
 redis.call('ZADD', lfuKey, 0, member)
-return victim
+if incomingVersion > watermark then
+  redis.call('HSET', KEYS[4], member, incomingVersion)
+end
+return {victim, 1, payload}
 `
 
 const TOUCH_SCRIPT = `
-if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+local raw = redis.call('GET', KEYS[1])
+if not raw then return false end
+
+local record = cjson.decode(raw)
+record.hits = record.hits + 1
+record.lastAccessedAt = tonumber(ARGV[1])
+
+local next = cjson.encode(record)
+redis.call('SET', KEYS[1], next, 'KEEPTTL')
 redis.call('ZADD', KEYS[2], ARGV[1], ARGV[2])
 redis.call('ZINCRBY', KEYS[3], 1, ARGV[2])
+return next
+`
+
+const INVALIDATE_THROUGH_VERSION_SCRIPT = `
+local watermark = tonumber(redis.call('HGET', KEYS[5], ARGV[1]) or '-1')
+local invalidatedVersion = tonumber(ARGV[2])
+if invalidatedVersion > watermark then
+  redis.call('HSET', KEYS[5], ARGV[1], invalidatedVersion)
+end
+
+local raw = redis.call('GET', KEYS[1])
+if not raw then return 0 end
+
+local record = cjson.decode(raw)
+if tonumber(record.version) > invalidatedVersion then return 0 end
+
+redis.call('DEL', KEYS[1])
+redis.call('SREM', KEYS[2], ARGV[1])
+redis.call('ZREM', KEYS[3], ARGV[1])
+redis.call('ZREM', KEYS[4], ARGV[1])
 return 1
 `
 
@@ -121,26 +165,18 @@ export class CacheStore {
     return record
   }
 
-  async touch(record: CacheRecord, now: number): Promise<CacheRecord> {
-    const member = memberFor(record.key)
-    const next = { ...record, hits: record.hits + 1, lastAccessedAt: now }
-    const ttl = await this.redis.pttl(keyForMember(member))
-    if (ttl > 0) {
-      await this.redis
-        .multi()
-        .set(keyForMember(member), JSON.stringify(next), 'PX', ttl)
-        .eval(
-          TOUCH_SCRIPT,
-          3,
-          keyForMember(member),
-          keys.cacheLru,
-          keys.cacheLfu,
-          now,
-          member,
-        )
-        .exec()
-    }
-    return next
+  async touch(key: ResourceKey, now: number): Promise<CacheRecord | null> {
+    const member = memberFor(key)
+    const raw = (await this.redis.eval(
+      TOUCH_SCRIPT,
+      3,
+      keyForMember(member),
+      keys.cacheLru,
+      keys.cacheLfu,
+      now,
+      member,
+    )) as string | null
+    return raw ? (JSON.parse(raw) as CacheRecord) : null
   }
 
   async put(
@@ -148,7 +184,7 @@ export class CacheStore {
     resource: ResourceView | null,
     settings: CacheSettings,
     now: number,
-  ): Promise<{ record: CacheRecord; evictedKey: ResourceKey | null }> {
+  ): Promise<{ record: CacheRecord; evictedKey: ResourceKey | null; written: boolean }> {
     const negative = resource === null
     const baseTtlSeconds = negative ? settings.negativeTtlSeconds : settings.ttlSeconds
     const salt = [...key].reduce((sum, character) => sum + character.charCodeAt(0), 0)
@@ -167,12 +203,13 @@ export class CacheStore {
       hits: 0,
     }
     const member = memberFor(key)
-    const victim = (await this.redis.eval(
+    const [victim, written, stored] = (await this.redis.eval(
       PUT_SCRIPT,
-      3,
+      4,
       keys.cacheIndex,
       keys.cacheLru,
       keys.cacheLfu,
+      keys.cacheVersionWatermarks,
       member,
       keys.cacheEntryPrefix,
       JSON.stringify(record),
@@ -180,13 +217,15 @@ export class CacheStore {
       settings.capacity,
       settings.eviction,
       now,
-    )) as string
+      record.version,
+    )) as [string, number, string]
 
     return {
-      record,
+      record: JSON.parse(stored) as CacheRecord,
       evictedKey: victim
         ? (Buffer.from(victim, 'base64url').toString('utf8') as ResourceKey)
         : null,
+      written: written === 1,
     }
   }
 
@@ -201,11 +240,32 @@ export class CacheStore {
       .exec()
   }
 
+  async invalidateThroughVersion(key: ResourceKey, version: number): Promise<boolean> {
+    const member = memberFor(key)
+    const invalidated = (await this.redis.eval(
+      INVALIDATE_THROUGH_VERSION_SCRIPT,
+      5,
+      keyForMember(member),
+      keys.cacheIndex,
+      keys.cacheLru,
+      keys.cacheLfu,
+      keys.cacheVersionWatermarks,
+      member,
+      version,
+    )) as number
+    return invalidated === 1
+  }
+
   async flush(): Promise<void> {
     const members = await this.redis.smembers(keys.cacheIndex)
     const transaction = this.redis.multi()
     for (const member of members) transaction.del(keyForMember(member))
-    transaction.del(keys.cacheIndex, keys.cacheLru, keys.cacheLfu)
+    transaction.del(
+      keys.cacheIndex,
+      keys.cacheLru,
+      keys.cacheLfu,
+      keys.cacheVersionWatermarks,
+    )
     await transaction.exec()
   }
 

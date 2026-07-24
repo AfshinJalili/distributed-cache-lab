@@ -2,7 +2,7 @@ import { Global, Inject, Module, type OnApplicationShutdown, type OnModuleInit }
 import { Queue } from 'bullmq'
 import type Redis from 'ioredis'
 import {
-  bullConnectionOptions,
+  bullQueueConnectionOptions,
   CacheStore,
   createRedis,
   DistributedLock,
@@ -63,7 +63,7 @@ class InfrastructureLifecycle implements OnModuleInit, OnApplicationShutdown {
       provide: REFRESH_QUEUE,
       useFactory: () =>
         new Queue(refreshQueueName, {
-          connection: bullConnectionOptions(),
+          connection: bullQueueConnectionOptions(),
           defaultJobOptions: {
             attempts: 4,
             backoff: { type: 'exponential', delay: 250 },

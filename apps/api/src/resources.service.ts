@@ -7,6 +7,7 @@ import {
   LabStateStore,
   OutboxEventEntity,
   ResourceEntity,
+  toResourceView,
 } from '@dcl/platform'
 import { EVENT_BUS, LAB_STATE } from './tokens'
 
@@ -45,12 +46,7 @@ export class ResourcesService {
         resourceKey: key,
         writePolicy,
         version: saved.version,
-        payload: {
-          key: saved.key,
-          version: saved.version,
-          document: saved.document,
-          updatedAt: saved.updatedAt.toISOString(),
-        },
+        payload: toResourceView(saved),
         status: 'pending',
       })
       const savedEvent = await manager.save(event)

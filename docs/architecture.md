@@ -55,6 +55,7 @@ Redis is configured with `maxmemory-policy noeviction`. The application owns a d
 - a set is the authoritative entry index;
 - a sorted set records last access for LRU;
 - a sorted set records frequency for LFU;
+- a version watermark survives invalidation so delayed refreshes and outbox retries cannot recreate stale data;
 - Lua scripts atomically prune missing entries, choose a victim, update metadata, and write a record.
 
 Changing capacity invokes a trim operation immediately. Reads update both policy indexes so switching policies remains meaningful.
@@ -88,7 +89,10 @@ sequenceDiagram
     W->>P: mark event processed
 ```
 
-The workers are competing consumers. Row locking prevents double claims, and applying an event is idempotent so a retry is safe.
+The workers are competing consumers. Row locking prevents double claims. Each claim increments an
+attempt number that acts as a fencing token, and an expired `processing` lease can be reclaimed after
+a worker crash. Cache writes are monotonic by resource version, while invalidation advances a
+per-key version watermark. Together these rules make retries and out-of-order completion safe.
 
 ## Shared observability
 

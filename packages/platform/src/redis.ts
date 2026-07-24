@@ -28,3 +28,7 @@ export function bullConnectionOptions(): RedisOptions {
     commandTimeout: undefined,
   }
 }
+
+export function bullQueueConnectionOptions(): RedisOptions {
+  return redisOptions()
+}

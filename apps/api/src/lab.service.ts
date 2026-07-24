@@ -6,7 +6,6 @@ import type {
   CacheSettings,
   FaultName,
   LabState,
-  ResourceView,
 } from '@dcl/contracts'
 import {
   CacheStore,
@@ -15,19 +14,34 @@ import {
   ResourceEntity,
   defaultSettings,
   resetSeedData,
+  toResourceView,
 } from '@dcl/platform'
 import { PatchSettingsDto } from './dto'
 import { ResourcesService } from './resources.service'
 import { ToxiproxyService } from './toxiproxy.service'
 import { CACHE_STORE, EVENT_BUS, LAB_STATE, REFRESH_QUEUE } from './tokens'
 
-function toView(entity: ResourceEntity): ResourceView {
-  return {
-    key: entity.key,
-    version: entity.version,
-    document: entity.document,
-    updatedAt: entity.updatedAt.toISOString(),
+const faultEvents: Record<
+  FaultName,
+  {
+    title: string
+    enabledDetail: string
+    disabledDetail: string
+    emitBeforeEnable: boolean
   }
+> = {
+  'redis-outage': {
+    title: 'REDIS OUTAGE',
+    enabledDetail: 'Toxiproxy will cut cache responses; circuit breakers should open',
+    disabledDetail: 'Redis connectivity restored; circuit breakers will recover',
+    emitBeforeEnable: true,
+  },
+  'slow-origin': {
+    title: 'SLOW ORIGIN',
+    enabledDetail: 'PostgreSQL proxy latency increased',
+    disabledDetail: 'PostgreSQL proxy latency restored',
+    emitBeforeEnable: false,
+  },
 }
 
 @Injectable()
@@ -152,7 +166,7 @@ export class LabService {
       { key: 'catalog:home' },
     ])
     for (const resource of resources) {
-      await this.cache.put(resource.key, toView(resource), settings, now)
+      await this.cache.put(resource.key, toResourceView(resource), settings, now)
     }
     await this.events.emit({
       at: now,
@@ -165,34 +179,18 @@ export class LabService {
   }
 
   async setFault(name: FaultName, enabled: boolean): Promise<void> {
-    if (name === 'redis-outage' && enabled) {
-      await this.events.emit({
+    const definition = faultEvents[name]
+    const emit = async () =>
+      this.events.emit({
         at: await this.labState.now(),
         kind: 'fault',
-        title: 'REDIS OUTAGE ENABLED',
-        detail: 'Toxiproxy will cut cache responses; circuit breakers should open',
+        title: `${definition.title} ${enabled ? 'ENABLED' : 'CLEARED'}`,
+        detail: enabled ? definition.enabledDetail : definition.disabledDetail,
         instanceId: this.instanceId,
       })
-      await this.toxiproxy.setFault(name, enabled)
-      return
-    }
 
+    if (enabled && definition.emitBeforeEnable) await emit()
     await this.toxiproxy.setFault(name, enabled)
-    await this.events
-      .emit({
-        at: await this.labState.now(),
-        kind: 'fault',
-        title: `${name.toUpperCase()} ${enabled ? 'ENABLED' : 'CLEARED'}`,
-        detail:
-          name === 'slow-origin'
-            ? 'PostgreSQL proxy latency changed'
-            : 'Redis connectivity restored; circuit breakers will half-open',
-        instanceId: this.instanceId,
-      })
-      .catch(() => undefined)
-  }
-
-  isFaultName(value: string): value is FaultName {
-    return value === 'redis-outage' || value === 'slow-origin'
+    if (!enabled || !definition.emitBeforeEnable) await emit().catch(() => undefined)
   }
 }

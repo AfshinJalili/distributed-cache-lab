@@ -8,6 +8,7 @@ import {
   UnprocessableEntityException,
 } from '@nestjs/common'
 import { ApiOperation, ApiTags } from '@nestjs/swagger'
+import { isFaultName } from '@dcl/contracts'
 import { AdvanceClockDto, PatchSettingsDto, SetFaultDto } from './dto'
 import { LabService } from './lab.service'
 
@@ -50,7 +51,7 @@ export class LabController {
   @Post('faults/:name')
   @ApiOperation({ summary: 'Enable or clear a Toxiproxy failure drill' })
   async fault(@Param('name') name: string, @Body() body: SetFaultDto) {
-    if (!this.lab.isFaultName(name)) {
+    if (!isFaultName(name)) {
       throw new UnprocessableEntityException(`Unknown fault: ${name}`)
     }
     await this.lab.setFault(name, body.enabled)

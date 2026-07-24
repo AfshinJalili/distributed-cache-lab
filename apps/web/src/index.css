@@ -1037,6 +1037,7 @@ input:focus-visible {
 
 .kind-miss,
 .kind-evict,
+.kind-bypass,
 .kind-fault {
   background: #ff7c66;
 }

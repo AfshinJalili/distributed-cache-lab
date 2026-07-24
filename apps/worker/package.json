@@ -8,7 +8,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "start": "node dist/main.js",
     "dev": "tsx watch src/main.ts",
-    "test": "jest --runInBand --passWithNoTests"
+    "test": "jest --runInBand --passWithNoTests",
+    "test:integration": "jest --runInBand --testPathPatterns=integration"
   },
   "dependencies": {
     "@dcl/contracts": "1.0.0",
